@@ -11,8 +11,10 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"io"
+	"io/ioutil"
 	"math/bits"
 	"os"
+	"path"
 	"runtime"
 
 	"github.com/detailyang/go-fallocate"
@@ -172,7 +174,89 @@ func (sb *Sealer) DataCid(ctx context.Context, pieceSize abi.UnpaddedPieceSize, 
 	}, nil
 }
 
+func (sb *Sealer) MakeUnsealed(pieceCID cid.Cid, srcPath string) error {
+	dir, _ := path.Split(srcPath)
+	dir = path.Join(dir, "../")
+	dir = path.Join(dir, "../")
+	dir = path.Join(dir, "addpiece")
+
+	srcFile, err := os.OpenFile(srcPath, os.O_RDONLY, 0666)
+	if err != nil {
+		return err
+	}
+	dstFile, err := os.OpenFile(path.Join(dir, "unsealed"), os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0666)
+	if err != nil {
+		return err
+	}
+	defer srcFile.Close()
+	defer dstFile.Close()
+
+	if _, err = io.Copy(dstFile, srcFile); err != nil {
+		return err
+	}
+
+	text, err := pieceCID.MarshalText()
+	if err != nil {
+		return err
+	}
+
+	return ioutil.WriteFile(path.Join(dir, "cid"), text, 0666)
+}
+
+func (sb *Sealer) GetUnsealed(ctx context.Context, sector storiface.SectorRef, pieceSize abi.UnpaddedPieceSize) (abi.PieceInfo, error) {
+	var done func()
+	defer func() {
+		if done != nil {
+			done()
+		}
+	}()
+	stagedPath, done, err := sb.sectors.AcquireSector(ctx, sector, 0, storiface.FTUnsealed, storiface.PathSealing)
+	if err != nil {
+		return abi.PieceInfo{}, err
+	}
+	dir, _ := path.Split(stagedPath.Unsealed)
+	dir = path.Join(dir, "../")
+	dir = path.Join(dir, "../")
+	dir = path.Join(dir, "addpiece")
+
+	bs, err := os.ReadFile(path.Join(dir, "cid"))
+	if err != nil {
+		return abi.PieceInfo{}, err
+	}
+
+	var id cid.Cid
+	if err = id.UnmarshalText(bs); err != nil {
+		return abi.PieceInfo{}, err
+	}
+
+	srcFile, err := os.OpenFile(path.Join(dir, "unsealed"), os.O_RDONLY, 0666)
+	if err != nil {
+		return abi.PieceInfo{}, err
+	}
+	dstFile, err := os.OpenFile(stagedPath.Unsealed, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0666)
+	if err != nil {
+		return abi.PieceInfo{}, err
+	}
+	defer srcFile.Close()
+	defer dstFile.Close()
+
+	_, err = io.Copy(dstFile, srcFile)
+
+	return abi.PieceInfo{
+		Size:     pieceSize.Padded(),
+		PieceCID: id,
+	}, err
+}
+
 func (sb *Sealer) AddPiece(ctx context.Context, sector storiface.SectorRef, existingPieceSizes []abi.UnpaddedPieceSize, pieceSize abi.UnpaddedPieceSize, file storiface.Data) (abi.PieceInfo, error) {
+
+	// 如果有模版，从模版拷贝扇区
+	if pi, err := sb.GetUnsealed(ctx, sector, pieceSize); err == nil {
+		return pi, nil
+	} else {
+		log.Infof("get unsealed error: %v", err)
+	}
+
 	// TODO: allow tuning those:
 	chunk := abi.PaddedPieceSize(4 << 20)
 	parallel := runtime.NumCPU()
@@ -352,6 +436,11 @@ func (sb *Sealer) AddPiece(ctx context.Context, sector storiface.SectorRef, exis
 		}
 
 		pieceCID = paddedCid
+	}
+
+	// 拷贝扇区到模板目录
+	if err = sb.MakeUnsealed(pieceCID, stagedPath.Unsealed); err != nil {
+		log.Infof("make unsealed err: %s", err.Error())
 	}
 
 	return abi.PieceInfo{
